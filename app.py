@@ -4,10 +4,14 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
+from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
+from xgboost import XGBRegressor
+from codecarbon import EmissionsTracker
+import io, os, tempfile
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -470,7 +474,7 @@ def train_duration_model(df):
     df["model_type_enc"] = le_mt.fit_transform(df["model_type"])
     df["gpu_type_enc"]   = le_gpu.fit_transform(df["gpu_type"])
 
-    # ── Engineered features (must match predict_duration exactly) ────────────
+    # ── Engineered features ──────────────────────────────────────────────────
     params_m = df["num_parameters"] / 1e6
     df["log_params"]    = np.log1p(params_m)
     df["log_dataset"]   = np.log1p(df["dataset_size"])
@@ -497,11 +501,44 @@ def train_duration_model(df):
         X, y, y_raw, test_size=0.2, random_state=42
     )
 
-    model = GradientBoostingRegressor(
+    # ── Base learners (GBR + RF + XGBoost) ───────────────────────────────────
+    gbr = GradientBoostingRegressor(
         n_estimators=400, max_depth=4, learning_rate=0.05,
-        subsample=0.8, min_samples_leaf=5, max_features=0.8, random_state=42,
+        subsample=0.8, min_samples_leaf=5, max_features=0.8, random_state=42
     )
-    model.fit(X_train, y_train)
+    rf = RandomForestRegressor(
+        n_estimators=200, max_depth=6, max_features=0.7,
+        min_samples_split=10, n_jobs=-1, random_state=42
+    )
+    xgb = XGBRegressor(
+        n_estimators=300, max_depth=5, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=0.1, reg_lambda=1.0,
+        random_state=42, verbosity=0, n_jobs=-1
+    )
+
+    # ── Stacking ensemble with XGBoost added ─────────────────────────────────
+    stacking_model = StackingRegressor(
+        estimators=[('gbr', gbr), ('rf', rf), ('xgb', xgb)],
+        final_estimator=RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0]),
+        cv=5, n_jobs=-1, verbose=0
+    )
+
+    # ── Wrap fit() with CodeCarbon tracker ───────────────────────────────────
+    _tmpdir = tempfile.mkdtemp()
+    tracker = EmissionsTracker(
+        project_name="GreenTrainAI_ModelFit",
+        output_dir=_tmpdir,
+        log_level="error",
+        save_to_file=True,
+        tracking_mode="process",
+    )
+    tracker.start()
+    stacking_model.fit(X_train, y_train)
+    training_co2_kg = tracker.stop()          # kg CO₂eq
+    training_co2_g  = (training_co2_kg or 0.0) * 1000   # → grams
+
+    model = stacking_model
 
     y_pred_test  = np.expm1(model.predict(X_test))
     y_pred_train = np.expm1(model.predict(X_train))
@@ -514,14 +551,15 @@ def train_duration_model(df):
     r2_train = r2_score(y_raw_train_arr, y_pred_train)
 
     eval_data = {
-        "y_test":       y_raw_test_arr,
-        "y_pred_test":  y_pred_test,
-        "y_train":      y_raw_train_arr,
-        "y_pred_train": y_pred_train,
-        "mae_train":    mae_train,
-        "r2_train":     r2_train,
-        "residuals":    y_raw_test_arr - y_pred_test,
-        "features":     features,
+        "y_test":            y_raw_test_arr,
+        "y_pred_test":       y_pred_test,
+        "y_train":           y_raw_train_arr,
+        "y_pred_train":      y_pred_train,
+        "mae_train":         mae_train,
+        "r2_train":          r2_train,
+        "residuals":         y_raw_test_arr - y_pred_test,
+        "features":          features,
+        "training_co2_g":    training_co2_g,   # ← NEW: CodeCarbon measurement
     }
     return model, le_mt, le_gpu, mae, r2, eval_data
 
@@ -885,6 +923,48 @@ best_energy = current_energy
 best_co2 = best_energy * best_intensity
 savings_pct = max(0, (current_co2 - best_co2) / current_co2 * 100)
 
+# ── 🌱 Sustainability Report (sidebar — rendered after shared computation) ────
+with st.sidebar:
+    st.markdown("---")
+    st.markdown('<div class="section-header">🌱 Sustainability Report</div>', unsafe_allow_html=True)
+
+    _training_co2_g  = eval_data.get("training_co2_g", 0.0)
+    _sr_co2_display  = f"{_training_co2_g:.4f} g" if _training_co2_g < 1.0 else f"{_training_co2_g:.3f} g"
+    _sr_color        = "#00ff87" if _training_co2_g < 1.0 else "#ffb347" if _training_co2_g < 10.0 else "#ff5757"
+    _infer_co2       = current_co2
+    _infer_color     = "#00ff87" if _infer_co2 < 200 else "#ffb347" if _infer_co2 < 500 else "#ff5757"
+    _savings_g       = max(0, current_co2 - best_co2)
+
+    st.markdown(f"""
+    <div style="background:#0a1a10;border:1px solid #1e3325;border-radius:12px;
+                padding:1rem;font-family:'Space Mono',monospace;font-size:0.75rem">
+        <div style="color:#6b8f72;font-size:0.62rem;letter-spacing:1.5px;margin-bottom:0.4rem">
+            🤖 MODEL FIT (CodeCarbon)
+        </div>
+        <div style="color:{_sr_color};font-size:1.1rem;font-weight:700;margin-bottom:0.8rem">
+            {_sr_co2_display} CO₂eq
+        </div>
+        <div style="color:#6b8f72;font-size:0.62rem;letter-spacing:1.5px;margin-bottom:0.4rem">
+            ⚡ INFERENCE RUN (est.)
+        </div>
+        <div style="color:{_infer_color};font-size:1rem;font-weight:700;margin-bottom:0.8rem">
+            {_infer_co2:.0f} g CO₂
+        </div>
+        <div style="color:#6b8f72;font-size:0.62rem;letter-spacing:1.5px;margin-bottom:0.4rem">
+            💚 POTENTIAL SAVINGS
+        </div>
+        <div style="color:#00ff87;font-size:1rem;font-weight:700;margin-bottom:0.8rem">
+            {_savings_g:.0f} g saved
+        </div>
+        <div style="border-top:1px solid #1e3325;padding-top:0.6rem;
+                    color:#6b8f72;font-size:0.62rem;line-height:1.6">
+            Stack: <span style="color:#e8f5e9">GBR + RF + XGBoost</span><br>
+            Tracker: <span style="color:#e8f5e9">CodeCarbon v3</span><br>
+            Zone: <span style="color:#e8f5e9">{ZONE_LABELS.get(zone_key, zone_key)}</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — Prediction & Scheduling
@@ -1060,9 +1140,76 @@ with tab1:
     )
     st.plotly_chart(fig2, use_container_width=True)
 
+    # ── 🌱 Sustainability Report (Tab 1) ──────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div class="section-header">🌱 Sustainability Report — This Run</div>', unsafe_allow_html=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Carbon Budget Planner (NEW)
+    training_co2_g = eval_data.get("training_co2_g", 0.0)
+    total_system_co2 = training_co2_g + current_co2   # meta-model fit + inference
+    total_optimal_co2 = training_co2_g + best_co2
+
+    sr1, sr2, sr3, sr4 = st.columns(4)
+    sr_cards = [
+        ("🤖 Model Fit (CodeCarbon)", f"{training_co2_g:.4f} g", "#ce93d8",
+         "CO₂eq measured by CodeCarbon during stacking ensemble training"),
+        ("⚡ Inference (Now)", f"{current_co2:.0f} g", "#ff5757",
+         f"Estimated CO₂ at current grid intensity ({current_intensity:.0f} gCO₂/kWh)"),
+        ("🌿 Inference (Optimal)", f"{best_co2:.0f} g", "#00ff87",
+         f"Estimated CO₂ at best window ({best_intensity:.0f} gCO₂/kWh)"),
+        ("💚 Total Saving", f"{max(0, current_co2-best_co2):.0f} g", "#ffb347",
+         "CO₂ saved by scheduling at the optimal time"),
+    ]
+    for col, (label, val, color, desc) in zip([sr1, sr2, sr3, sr4], sr_cards):
+        with col:
+            st.markdown(f"""
+            <div style="background:#111a14;border:1px solid #1e3325;border-radius:12px;
+                        padding:1rem 1.2rem;text-align:center">
+                <div style="font-size:0.68rem;color:#6b8f72;letter-spacing:1.5px;
+                            font-family:'Space Mono',monospace;margin-bottom:6px">{label}</div>
+                <div style="font-family:'Space Mono',monospace;font-size:1.5rem;
+                            font-weight:700;color:{color}">{val}</div>
+                <div style="font-size:0.65rem;color:#3a5940;margin-top:4px;
+                            font-family:'Space Mono',monospace">{desc[:55]}…</div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Stacked bar: model fit vs inference breakdown
+    fig_sr = go.Figure()
+    fig_sr.add_trace(go.Bar(
+        name="Model Fit (CodeCarbon)", x=["Start Now", "Optimal Window"],
+        y=[training_co2_g, training_co2_g],
+        marker_color="#ce93d8",
+        hovertemplate="Model Fit CO₂: <b>%{y:.4f} g</b><extra></extra>"
+    ))
+    fig_sr.add_trace(go.Bar(
+        name="Inference CO₂", x=["Start Now", "Optimal Window"],
+        y=[current_co2, best_co2],
+        marker_color=["#ff5757", "#00ff87"],
+        hovertemplate="Inference CO₂: <b>%{y:.1f} g</b><extra></extra>"
+    ))
+    fig_sr.update_layout(
+        barmode="stack",
+        plot_bgcolor="#0a0f0d", paper_bgcolor="#0a0f0d",
+        font=dict(color="#6b8f72", family="Space Mono"),
+        height=260, margin=dict(l=20, r=20, t=30, b=40),
+        xaxis=dict(gridcolor="#1e3325", zeroline=False),
+        yaxis=dict(title="Total CO₂ (g)", gridcolor="#1e3325", zeroline=False),
+        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
+        title=dict(text="Carbon Cost Breakdown: Model Fit vs Inference",
+                   font=dict(color="#e8f5e9", size=12))
+    )
+    st.plotly_chart(fig_sr, use_container_width=True)
+
+    st.markdown(f"""
+    <div style="background:#0a1a10;border:1px solid #1e3325;border-radius:10px;
+                padding:0.9rem 1.4rem;font-family:'Space Mono',monospace;font-size:0.75rem;color:#6b8f72">
+    📌 <b style="color:#e8f5e9">How this is measured:</b>
+    Model fit CO₂ tracked by <b style="color:#ce93d8">CodeCarbon</b> (hardware power × duration × grid intensity).
+    Inference CO₂ estimated from GPU TDP × training duration × grid carbon intensity.
+    Ensemble: <b style="color:#00ff87">GBR + RandomForest + XGBoost → RidgeCV meta-learner</b>.
+    </div>
+    """, unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab2:
     if not enable_budget:
@@ -1539,9 +1686,44 @@ with tab5:
         </div>""", unsafe_allow_html=True)
     with col3:
         st.markdown(f"""<div class="metric-card">
-            <div class="metric-value" style="font-size:1.5rem">GBR</div>
-            <div class="metric-label">Model: Gradient Boosting</div>
+            <div class="metric-value" style="font-size:1.5rem">Stack</div>
+            <div class="metric-label">GBR + RF + XGBoost</div>
         </div>""", unsafe_allow_html=True)
+
+    # ── CodeCarbon: CO₂ emitted during model training ─────────────────────────
+    training_co2_g = eval_data.get("training_co2_g", 0.0)
+    co2_display = f"{training_co2_g:.4f}" if training_co2_g < 1.0 else f"{training_co2_g:.2f}"
+    co2_color = "#00ff87" if training_co2_g < 1.0 else "#ffb347" if training_co2_g < 10.0 else "#ff5757"
+    equiv_phones = training_co2_g / 8.22
+    equiv_km     = training_co2_g / 120
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#0a1f10,#061209);border:1.5px solid {co2_color};
+                border-radius:14px;padding:1.2rem 1.8rem;margin:1.2rem 0;
+                display:flex;align-items:center;gap:2rem;flex-wrap:wrap">
+        <div>
+            <div style="font-family:'Space Mono',monospace;font-size:0.65rem;letter-spacing:2px;color:#6b8f72;margin-bottom:4px">
+                🌿 CO₂ EMITTED DURING MODEL TRAINING (CodeCarbon)
+            </div>
+            <div style="font-family:'Space Mono',monospace;font-size:2rem;font-weight:700;color:{co2_color}">
+                {co2_display} g CO₂eq
+            </div>
+        </div>
+        <div style="display:flex;gap:2rem">
+            <div style="text-align:center">
+                <div style="font-family:'Space Mono',monospace;font-size:1rem;color:#e8f5e9">{equiv_phones:.4f}×</div>
+                <div style="font-size:0.7rem;color:#6b8f72">📱 Phone charges</div>
+            </div>
+            <div style="text-align:center">
+                <div style="font-family:'Space Mono',monospace;font-size:1rem;color:#e8f5e9">{equiv_km:.5f} km</div>
+                <div style="font-size:0.7rem;color:#6b8f72">🚗 Driving equiv.</div>
+            </div>
+            <div style="text-align:center">
+                <div style="font-family:'Space Mono',monospace;font-size:1rem;color:#00ff87">GBR + RF + XGBoost</div>
+                <div style="font-size:0.7rem;color:#6b8f72">🤖 Stacking ensemble</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     c1, c2 = st.columns(2)
@@ -1550,7 +1732,14 @@ with tab5:
         features = ["model_type_enc","log_params","num_layers","log_dataset",
                     "batch_size","epochs","gpu_tflops","gpu_tdp_watts",
                     "tdp_per_tflop","log_steps","log_compute","arch_mult"]
-        importance = dur_model.feature_importances_
+        # StackingRegressor: average feature importances from GBR + RF + XGBoost base learners
+        try:
+            gbr_imp = dur_model.named_estimators_["gbr"].feature_importances_
+            rf_imp  = dur_model.named_estimators_["rf"].feature_importances_
+            xgb_imp = dur_model.named_estimators_["xgb"].feature_importances_
+            importance = (gbr_imp + rf_imp + xgb_imp) / 3.0
+        except Exception:
+            importance = np.ones(len(features)) / len(features)
         fi_df = pd.DataFrame({"feature":features,"importance":importance}).sort_values("importance")
         fig6 = go.Figure(go.Bar(
             x=fi_df["importance"], y=fi_df["feature"], orientation="h",
@@ -1639,7 +1828,7 @@ with tab5:
 # TAB 6 — Model Evaluation (NEW)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab6:
-    st.markdown('<div class="section-header">🔬 Model Health Report — Gradient Boosting Regressor</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">🔬 Model Health Report — Stacking Ensemble (GBR + RF + XGBoost)</div>', unsafe_allow_html=True)
 
     y_test       = eval_data["y_test"]
     y_pred_test  = eval_data["y_pred_test"]
