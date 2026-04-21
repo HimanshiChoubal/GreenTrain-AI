@@ -6,7 +6,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
 from sklearn.linear_model import RidgeCV
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder  # used for model_type only; GPU now uses feature embeddings
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
 from xgboost import XGBRegressor
@@ -14,6 +14,36 @@ from codecarbon import EmissionsTracker
 import io, os, tempfile
 import warnings
 warnings.filterwarnings("ignore")
+
+
+# ── nvidia-ml-py: graceful import ────────────────────────────────────────────
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    _NVML_AVAILABLE = True
+except Exception:
+    _NVML_AVAILABLE = False
+
+# ── Live GPU monitoring via nvidia-ml-py ──────────────────────────────────────
+def get_live_gpu_metrics():
+    """
+    Returns a dict with live GPU power (W) and temperature (°C) for GPU 0.
+    Falls back to None values if no NVIDIA GPU is detected.
+    """
+    if not _NVML_AVAILABLE:
+        return {"power_w": None, "temp_c": None, "name": None, "available": False}
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)      # milliwatts
+        temp_c   = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+        name     = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(name, bytes):
+            name = name.decode("utf-8")
+        return {"power_w": power_mw / 1000.0, "temp_c": temp_c, "name": name, "available": True}
+    except Exception:
+        return {"power_w": None, "temp_c": None, "name": None, "available": False}
+
+
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -305,7 +335,7 @@ ZONE_LABELS = {
     "AU-NSW": "🇦🇺 Australia NSW",
 }
 
-# ── NEW: Cloud pricing data ───────────────────────────────────────────────────
+# ── Cloud pricing data ───────────────────────────────────────────────────
 # Cost per hour (USD) for on-demand instances, per GPU unit
 CLOUD_PRICING = {
     "AWS": {
@@ -468,11 +498,12 @@ def train_duration_model(df):
         "LSTM":4.0, "ResNet":3.0, "Transformer":7.0, "BERT_small":7.0,
     }
 
+    # ── Encoders ─────────────────────────────────────────────────────────────
+    # GPU is NOT label-encoded — we use gpu_tdp_watts + gpu_tflops as continuous
+    # features so the model generalises to unseen / custom hardware.
     le_mt  = LabelEncoder()
-    le_gpu = LabelEncoder()
     df = df.copy()
     df["model_type_enc"] = le_mt.fit_transform(df["model_type"])
-    df["gpu_type_enc"]   = le_gpu.fit_transform(df["gpu_type"])
 
     # ── Engineered features ──────────────────────────────────────────────────
     params_m = df["num_parameters"] / 1e6
@@ -486,6 +517,8 @@ def train_duration_model(df):
     df["tdp_per_tflop"] = df["gpu_tdp_watts"] / df["gpu_tflops"]
     df["arch_mult"]     = df["model_type"].map(ARCH_MULT)
 
+    # gpu_type_enc is intentionally REMOVED — GPU identity is now represented
+    # entirely through gpu_tdp_watts, gpu_tflops, and tdp_per_tflop.
     features = [
         "model_type_enc", "log_params", "num_layers",
         "log_dataset",    "batch_size", "epochs",
@@ -561,18 +594,27 @@ def train_duration_model(df):
         "features":          features,
         "training_co2_g":    training_co2_g,   # ← NEW: CodeCarbon measurement
     }
-    return model, le_mt, le_gpu, mae, r2, eval_data
+    # le_gpu is returned as None to signal feature-based GPU embedding is active
+    return model, le_mt, None, mae, r2, eval_data
 
 
 def predict_duration(model, le_mt, le_gpu, model_type, num_params, num_layers,
                      dataset_size, batch_size, epochs, gpu_type, gpu_tdp, gpu_tflops):
+    """
+    Predict training duration in minutes.
+
+    GPU identity is represented through continuous features (gpu_tdp, gpu_tflops,
+    tdp_per_tflop) instead of a LabelEncoder, so the model generalises to any
+    GPU — including the 'Other/Custom' option.  le_gpu is accepted for API
+    compatibility but is intentionally unused.
+    """
     ARCH_MULT = {
         "MLP":1.0, "CNN":2.5, "RNN":3.0, "GRU":3.5,
         "LSTM":4.0, "ResNet":3.0, "Transformer":7.0, "BERT_small":7.0,
     }
     try:
         mt_enc = le_mt.transform([model_type])[0]
-    except:
+    except Exception:
         mt_enc = 0
 
     params_m     = num_params / 1e6
@@ -584,7 +626,6 @@ def predict_duration(model, le_mt, le_gpu, model_type, num_params, num_layers,
     tdp_per_tflop= gpu_tdp / gpu_tflops
     arch_mult    = ARCH_MULT.get(model_type, 3.0)
 
-    import pandas as pd
     X = pd.DataFrame([[mt_enc, log_params, num_layers, log_dataset,
                        batch_size, epochs, gpu_tflops, gpu_tdp,
                        tdp_per_tflop, log_steps, log_compute, arch_mult]],
@@ -694,7 +735,7 @@ def evaluate_budget_checklist(co2_grams, budget_grams):
     return status, pct, color, badge, tip
 
 
-def suggest_green_alternatives(co2_grams, budget_grams, gpu_type, dur_min, best_intensity):
+def suggest_green_alternatives(co2_grams, budget_grams, gpu_type, dur_min, best_intensity, active_gpu_spec=None):
     """Suggest config tweaks to bring run under budget."""
     suggestions = []
     if co2_grams <= budget_grams:
@@ -702,8 +743,8 @@ def suggest_green_alternatives(co2_grams, budget_grams, gpu_type, dur_min, best_
 
     overage_pct = (co2_grams - budget_grams) / co2_grams * 100
 
-    # Suggest lower-TDP GPU
-    current_tdp = GPU_SPECS[gpu_type]["tdp"]
+    # Suggest lower-TDP GPU (only from known GPU_SPECS catalogue)
+    current_tdp = (active_gpu_spec or GPU_SPECS.get(gpu_type, {"tdp": 9999}))["tdp"]
     for g, s in GPU_SPECS.items():
         if s["tdp"] < current_tdp:
             alt_energy = (s["tdp"]/1000) * (dur_min/60)
@@ -716,7 +757,7 @@ def suggest_green_alternatives(co2_grams, budget_grams, gpu_type, dur_min, best_
         "EU-FR": 80, "US-CAL": 180, "GB": 220, "EU-DE": 280,
         "AU-NSW": 420, "US-TEX": 380, "IN-SO": 500, "IN-WE": 560
     }
-    current_energy_kwh = (GPU_SPECS[gpu_type]["tdp"]/1000) * (dur_min/60)
+    current_energy_kwh = (current_tdp/1000) * (dur_min/60)
     for zone, intensity in sorted(zone_intensities.items(), key=lambda x: x[1]):
         alt_co2 = current_energy_kwh * intensity
         if alt_co2 <= budget_grams:
@@ -827,7 +868,21 @@ with st.sidebar:
     model_type = st.selectbox("Model Type",
         ["MLP","CNN","LSTM","Transformer","ResNet","BERT_small","RNN","GRU"])
 
-    gpu_type = st.selectbox("GPU Type", list(GPU_SPECS.keys()))
+    gpu_type = st.selectbox("GPU Type", list(GPU_SPECS.keys()) + ["Other/Custom"])
+
+    # ── Custom GPU fields (revealed when Other/Custom selected) ──
+    if gpu_type == "Other/Custom":
+        st.markdown("""<div style="background:#0a1a2e;border:1px solid #4fc3f7;border-radius:8px;
+                    padding:0.6rem 1rem;font-family:'Space Mono',monospace;font-size:0.72rem;color:#4fc3f7;margin-bottom:0.5rem">
+                    🛠 Custom GPU — enter specs manually</div>""", unsafe_allow_html=True)
+        custom_tdp    = st.number_input("Custom TDP (Watts)",    min_value=10, max_value=1200, value=250, step=10)
+        custom_tflops = st.number_input("Custom TFLOPS (FP32)",  min_value=0.1, max_value=200.0, value=20.0, step=0.5)
+        # Build a synthetic spec entry so downstream code is uniform
+        _active_gpu_spec = {"tdp": custom_tdp, "tflops": custom_tflops}
+    else:
+        _active_gpu_spec = GPU_SPECS[gpu_type]
+        custom_tdp    = _active_gpu_spec["tdp"]
+        custom_tflops = _active_gpu_spec["tflops"]
 
     # ── NEW: Multi-GPU ──
     n_gpus = st.select_slider("Number of GPUs", options=[1,2,4,8,16], value=1)
@@ -889,7 +944,9 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 ])
 
 # ── Shared computation ────────────────────────────────────────────────────────
-gpu = GPU_SPECS[gpu_type]
+# _active_gpu_spec is set in the sidebar block above; it handles both known GPUs
+# and the Other/Custom path uniformly.
+gpu = _active_gpu_spec
 num_params_actual = int(num_params * 1_000_000)
 
 # Single-GPU base duration
@@ -912,9 +969,19 @@ total_tdp_watts = gpu["tdp"] * n_gpus
 forecast_df = get_carbon_forecast(grid_df, zone_key, current_hour, scheduling_window)
 schedule_df = find_optimal_start(forecast_df, dur_min)
 
+# current_intensity always comes from the first row of the synthetic forecast
 current_intensity = forecast_df.iloc[0]["carbon_intensity"]
+
 current_energy = (total_tdp_watts / 1000) * dur_hrs
 current_co2 = current_energy * current_intensity
+
+# ── Live GPU Monitoring (nvidia-ml-py) ───────────────────────────────────────
+_live_gpu = get_live_gpu_metrics()
+# Effective power for energy/CO2 calc: prefer live reading, fall back to TDP
+if _live_gpu["available"] and _live_gpu["power_w"] is not None:
+    _effective_power_w = _live_gpu["power_w"] * n_gpus   # scale to n_gpus
+else:
+    _effective_power_w = total_tdp_watts                  # TDP estimate
 
 best_row = schedule_df.loc[schedule_df["avg_carbon_intensity"].idxmin()]
 best_offset = best_row["start_offset_hrs"]
@@ -935,6 +1002,28 @@ with st.sidebar:
     _infer_color     = "#00ff87" if _infer_co2 < 200 else "#ffb347" if _infer_co2 < 500 else "#ff5757"
     _savings_g       = max(0, current_co2 - best_co2)
 
+    # ── Live GPU power / temp (or TDP fallback) ──
+    if _live_gpu["available"]:
+        _power_label  = (
+            f"Live: {_live_gpu['power_w']:.0f} W"
+            f"<span style='color:#3a5940;font-size:0.6rem;margin-left:6px'>● NVML</span>"
+        )
+        _power_color  = "#00ff87"
+        _temp_str     = f"{_live_gpu['temp_c']}°C"
+        _temp_color   = "#00ff87" if _live_gpu["temp_c"] < 70 else "#ffb347" if _live_gpu["temp_c"] < 85 else "#ff5757"
+        _gpu_name_str = _live_gpu["name"]
+        _source_label = "nvidia-ml-py · live"
+    else:
+        _power_label  = (
+            f"Estimated: {gpu['tdp']} W"
+            f"<span style='color:#3a5940;font-size:0.6rem;margin-left:6px'>TDP</span>"
+        )
+        _power_color  = "#ffb347"
+        _temp_str     = "N/A"
+        _temp_color   = "#6b8f72"
+        _gpu_name_str = gpu_type if gpu_type != "Other/Custom" else "Custom GPU"
+        _source_label = "TDP estimate · no GPU detected"
+
     st.markdown(f"""
     <div style="background:#0a1a10;border:1px solid #1e3325;border-radius:12px;
                 padding:1rem;font-family:'Space Mono',monospace;font-size:0.75rem">
@@ -943,6 +1032,18 @@ with st.sidebar:
         </div>
         <div style="color:{_sr_color};font-size:1.1rem;font-weight:700;margin-bottom:0.8rem">
             {_sr_co2_display} CO₂eq
+        </div>
+        <div style="color:#6b8f72;font-size:0.62rem;letter-spacing:1.5px;margin-bottom:0.2rem">
+            ⚡ GPU POWER DRAW
+        </div>
+        <div style="color:{_power_color};font-size:1rem;font-weight:700;margin-bottom:0.4rem">
+            {_power_label}
+        </div>
+        <div style="color:#6b8f72;font-size:0.62rem;letter-spacing:1.5px;margin-bottom:0.2rem">
+            🌡 GPU TEMPERATURE
+        </div>
+        <div style="color:{_temp_color};font-size:1rem;font-weight:700;margin-bottom:0.8rem">
+            {_temp_str}
         </div>
         <div style="color:#6b8f72;font-size:0.62rem;letter-spacing:1.5px;margin-bottom:0.4rem">
             ⚡ INFERENCE RUN (est.)
@@ -958,6 +1059,8 @@ with st.sidebar:
         </div>
         <div style="border-top:1px solid #1e3325;padding-top:0.6rem;
                     color:#6b8f72;font-size:0.62rem;line-height:1.6">
+            GPU: <span style="color:#e8f5e9">{_gpu_name_str}</span><br>
+            Power src: <span style="color:#e8f5e9">{_source_label}</span><br>
             Stack: <span style="color:#e8f5e9">GBR + RF + XGBoost</span><br>
             Tracker: <span style="color:#e8f5e9">CodeCarbon v3</span><br>
             Zone: <span style="color:#e8f5e9">{ZONE_LABELS.get(zone_key, zone_key)}</span>
@@ -1148,6 +1251,32 @@ with tab1:
     total_system_co2 = training_co2_g + current_co2   # meta-model fit + inference
     total_optimal_co2 = training_co2_g + best_co2
 
+    # ── Live GPU power banner ─────────────────────────────────────────────────
+    if _live_gpu["available"]:
+        _pwr_color = "#00ff87"
+        _tmp_color = "#00ff87" if _live_gpu["temp_c"] < 70 else "#ffb347" if _live_gpu["temp_c"] < 85 else "#ff5757"
+        st.markdown(f"""
+        <div style="background:#071a0e;border:1px solid #00ff87;border-radius:10px;
+                    padding:0.7rem 1.2rem;margin-bottom:1rem;display:flex;align-items:center;
+                    gap:2rem;flex-wrap:wrap;font-family:'Space Mono',monospace;font-size:0.8rem">
+            <span style="color:#6b8f72;font-size:0.65rem;letter-spacing:1.5px">⚡ LIVE GPU</span>
+            <span style="color:#e8f5e9">{_live_gpu['name']}</span>
+            <span style="color:{_pwr_color};font-weight:700">{_live_gpu['power_w']:.0f} W</span>
+            <span style="color:#6b8f72">|</span>
+            <span style="color:{_tmp_color};font-weight:700">{_live_gpu['temp_c']}°C</span>
+            <span style="color:#3a5940;font-size:0.68rem">live · nvidia-ml-py</span>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div style="background:#0a0f0d;border:1px solid #1e3325;border-radius:10px;
+                    padding:0.7rem 1.2rem;margin-bottom:1rem;
+                    font-family:'Space Mono',monospace;font-size:0.75rem;color:#6b8f72">
+            ⚡ GPU Power: <b style="color:#ffb347">{gpu['tdp']} W (TDP estimate)</b>
+            &nbsp;·&nbsp; No NVIDIA GPU detected — install <code>nvidia-ml-py</code> for live telemetry.
+        </div>
+        """, unsafe_allow_html=True)
+
     sr1, sr2, sr3, sr4 = st.columns(4)
     sr_cards = [
         ("🤖 Model Fit (CodeCarbon)", f"{training_co2_g:.4f} g", "#ce93d8",
@@ -1322,7 +1451,7 @@ with tab2:
         st.plotly_chart(fig_gauge, use_container_width=True)
 
         # ── Green alternatives (if over budget) ──
-        suggestions = suggest_green_alternatives(current_co2, budget, gpu_type, dur_min, best_intensity)
+        suggestions = suggest_green_alternatives(current_co2, budget, gpu_type, dur_min, best_intensity, active_gpu_spec=_active_gpu_spec)
         if suggestions:
             st.markdown('<div class="section-header">💡 Green Alternatives to Fit Budget</div>', unsafe_allow_html=True)
             st.markdown(f"""<div class="budget-box">
@@ -1729,10 +1858,14 @@ with tab5:
     c1, c2 = st.columns(2)
 
     with c1:
-        features = ["model_type_enc","log_params","num_layers","log_dataset",
-                    "batch_size","epochs","gpu_tflops","gpu_tdp_watts",
-                    "tdp_per_tflop","log_steps","log_compute","arch_mult"]
+        features = eval_data.get("features", [
+            "model_type_enc","log_params","num_layers","log_dataset",
+            "batch_size","epochs","gpu_tflops","gpu_tdp_watts",
+            "tdp_per_tflop","log_steps","log_compute","arch_mult"
+        ])
         # StackingRegressor: average feature importances from GBR + RF + XGBoost base learners
+        # Note: gpu_type is NOT a feature — GPU identity is encoded via gpu_tdp_watts,
+        # gpu_tflops, and tdp_per_tflop (feature-based embedding for generalisation).
         try:
             gbr_imp = dur_model.named_estimators_["gbr"].feature_importances_
             rf_imp  = dur_model.named_estimators_["rf"].feature_importances_
@@ -1774,6 +1907,25 @@ with tab5:
         st.plotly_chart(fig7, use_container_width=True)
 
     st.markdown('<div class="section-header">📊 Parameters vs Training Duration</div>', unsafe_allow_html=True)
+
+    # ── GPU Feature Embedding & Live Monitoring notes ─────────────────────────
+    _live_note = (
+        f"🟢 Live GPU detected: <b style='color:#00ff87'>{_live_gpu['name']}</b> "
+        f"— {_live_gpu['power_w']:.0f} W · {_live_gpu['temp_c']}°C"
+        if _live_gpu["available"]
+        else "🟡 No NVIDIA GPU detected — install <code>nvidia-ml-py</code> for live power & temperature telemetry."
+    )
+    st.markdown(f"""
+    <div style="background:#111a14;border:1px solid #1e3325;border-radius:10px;
+                padding:0.9rem 1.4rem;margin-bottom:1rem;
+                font-family:'Space Mono',monospace;font-size:0.75rem;color:#6b8f72">
+    🖥 <b style="color:#e8f5e9">GPU Feature Embedding</b> — GPU identity is represented through
+    continuous physics-grounded features (<code>gpu_tdp_watts</code>, <code>gpu_tflops</code>,
+    <code>tdp_per_tflop</code>) instead of a LabelEncoder. This lets the model generalise to
+    <b style="color:#00ff87">any GPU</b>, including the <i>Other/Custom</i> option in the sidebar.<br><br>
+    ⚡ <b style="color:#e8f5e9">Live GPU Monitoring</b> — {_live_note}
+    </div>
+    """, unsafe_allow_html=True)
     fig8 = px.scatter(train_df, x="num_parameters", y="training_duration_min",
                      color="gpu_type", log_x=True,
                      color_discrete_sequence=["#00ff87","#00c46a","#ffb347","#ff8c42","#ff5757","#c44dff"],
